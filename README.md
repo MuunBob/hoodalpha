@@ -154,14 +154,30 @@ Infrastructure
     ├── DEX adapters
     ├── PostgreSQL
     ├── Redis
-    ├── NATS JetStream
+    ├── Asynq
     ├── Telegram API
-    └── External market/security providers
+    ├── Asynqmon
+└── External market/security providers
 ```
 
 ### Important design rule
 
 Financial business logic must not depend directly on Telegram SDKs, database drivers, RPC providers, HTTP frameworks, or vendor APIs. External systems are adapters.
+
+### Architecture decisions
+
+| Decision | Why |
+|---|---|
+| **PostgreSQL is the source of truth** | Money needs transactions, constraints and durable history. Balances use `NUMERIC`/exact integers, never floating point — `Wei` wraps `big.Int` so a wei is never rounded away. Timestamps are `TIMESTAMPTZ` and connections are pinned to UTC. |
+| **Redis is cache + Asynq backing store, never financial truth** | It holds queues, locks, rate limits and ephemeral state. Losing Redis must cost throughput, not accounting. |
+| **Asynq for background jobs** | Redis-backed, boring, well-supported, and it ships an inspection API. No Kafka, RabbitMQ or NATS: a personal bot on one VPS does not need a broker cluster. |
+| **Asynqmon for queue monitoring** | The official UI for Asynq. Admin-only, no authentication of its own, so compose binds it to `127.0.0.1`. |
+| **pg_partman for time-series partitions** | Child creation and retention are automated rather than hand-run in production. Only genuinely unbounded tables are partitioned. |
+| **Modular monolith, one deployable unit** | Two binaries (`api`, `worker`) share one codebase. No Kubernetes, no microservices, until an actual scaling or isolation problem appears. |
+| **Chain client is read-only** | Phase 1 has no signer and no broadcast path. Execution cannot be triggered by accident because the capability is absent, not merely disabled. |
+| **Retries are bounded everywhere** | Every RPC call has a timeout, a retry ceiling and exponential backoff. Only transport-level errors retry; `not found` and reverts are answers, not failures. |
+| **Task handlers are idempotent** | Asynq delivers at-least-once. Sync-state writes only advance, so a replayed task cannot rewind progress. Task IDs give financial operations a deduplication key. |
+| **Liveness and readiness are separate** | `/healthz` is dependency-free so a database blip cannot get a correctly-degraded process killed; `/readyz` reports the real dependency state. Wrong chain ID is `down`, a stale head is `degraded`. |
 
 ---
 
@@ -352,6 +368,118 @@ Community data is treated as a **confidence signal**, not proof of legitimacy.
 
 ---
 
+## Background Jobs & Queue Architecture
+
+The project uses **Asynq** as the background task queue.
+
+Official project:
+
+- [Asynq](https://github.com/hibiken/asynq)
+- Go module: `github.com/hibiken/asynq`
+
+Redis is the backing store for Asynq.
+
+Typical background tasks include:
+
+```text
+token:discover
+token:analyze
+token:security_scan
+token:market_scan
+token:insider_scan
+token:social_scan
+
+signal:score
+signal:notify
+
+trade:simulate
+trade:submit
+trade:monitor
+
+position:update
+position:recover_capital
+position:update_runner
+
+pnl:update
+
+system:reconcile
+system:health_check
+```
+
+Suggested queues:
+
+```text
+critical
+default
+analysis
+market
+notifications
+maintenance
+```
+
+Tasks must be retry-safe and idempotent where practical. Financial execution must never assume exactly-once task delivery.
+
+### Asynqmon
+
+Queue monitoring uses the official [Asynqmon](https://github.com/hibiken/asynqmon).
+
+Asynqmon is an operational/admin interface for inspecting:
+
+- pending tasks
+- active tasks
+- scheduled tasks
+- retries
+- failed tasks
+- archived tasks
+- queue state
+
+Asynqmon is not a source of financial truth and should not be exposed publicly without appropriate access controls.
+
+---
+
+## Database & Time-Series Storage
+
+PostgreSQL is the persistent source of truth.
+
+Redis is used for:
+
+- Asynq backing storage
+- cache
+- locks
+- rate limiting
+- short-lived state
+
+For large time-series workloads, the project uses native PostgreSQL declarative partitioning with **pg_partman** for partition creation and maintenance.
+
+The project does **not** partition every table.
+
+**Partitioned today:** `timeseries.audit_logs` — monthly RANGE partitions on
+`occurred_at`, 12-month retention, children dropped rather than detached.
+Append-only and unbounded: every command, state transition and operator action
+lands there.
+
+**Deliberately not partitioned:** `chain_sync_state`, and later `users`,
+`telegram_users`, `wallets`, `wallet_policies`, `tokens`, `token_contracts`,
+`orders`, `positions`. These are bounded current-state tables. Partitioning them
+would add child-table management cost and cross-partition joins for no gain.
+
+**Future candidates,** to be partitioned when the feature that writes them lands
+and the volume justifies it: `market_snapshots`, `wallet_events`,
+`insider_events`, `pnl_snapshots`, `daily_performance`.
+
+pg_partman is pinned to 5.5.0. Its background worker runs as
+`partman_maintainer`, a non-superuser role created by migration `00002`.
+Version 5.5 changed the BGW default away from a superuser specifically to
+mitigate privilege-escalation CVEs, and this project follows that: partition
+maintenance is routine, and routine operations should not hold superuser.
+
+All schema changes use versioned migrations (goose), embedded in the binary.
+Every migration has a tested `Down`: a migration you cannot roll back is one you
+cannot undo during an incident. `make db-recreate` proves the schema rebuilds
+from zero.
+
+---
+
 ## Telegram Control Plane
 
 Core commands:
@@ -463,8 +591,10 @@ Always re-check official documentation before relying on network endpoints, cont
 - Go
 - Clean Architecture
 - PostgreSQL 17
+- pg_partman
 - Redis
-- NATS JetStream
+- Asynq (`github.com/hibiken/asynq`)
+- Asynqmon (`github.com/hibiken/asynqmon`)
 - `go-ethereum`
 
 ### Web3
@@ -488,6 +618,12 @@ Always re-check official documentation before relying on network endpoints, cont
 - VPS
 - GitHub Actions
 
+### Background Jobs
+
+- Asynq (`github.com/hibiken/asynq`)
+- Asynqmon (`github.com/hibiken/asynqmon`)
+- Redis backing store
+
 ### Observability
 
 - structured logs
@@ -506,47 +642,46 @@ Optional later:
 
 ## Repository Structure
 
+Packages are created when something needs them, not in advance. What exists
+today (Phase 0 + Phase 1):
+
 ```text
 .
 ├── cmd/
-│   ├── api/
-│   ├── bot/
-│   ├── scanner/
-│   └── worker/
+│   ├── api/               operational HTTP server + websocket head subscriber
+│   ├── worker/            Asynq worker + periodic scheduler
+│   ├── migrate/           migration CLI (up/down/reset/status/version)
+│   └── healthcheck/       container HEALTHCHECK probe (distroless has no curl)
 │
 ├── internal/
-│   ├── domain/
-│   ├── application/
-│   ├── chain/
-│   ├── discovery/
-│   ├── token/
-│   ├── security/
-│   ├── market/
-│   ├── insider/
-│   ├── social/
-│   ├── scoring/
-│   ├── strategy/
-│   ├── risk/
-│   ├── wallet/
-│   ├── execution/
-│   ├── position/
-│   ├── pnl/
-│   ├── telegram/
+│   ├── domain/            Address, Hash, BlockRef, Wei, health types
+│   ├── application/       use cases: health check, chain sync
+│   ├── bootstrap/         dependency wiring + signal handling
+│   ├── chain/             go-ethereum adapter, retry policy, head subscriber
+│   ├── config/            environment loading and validation
+│   ├── httpapi/           /healthz, /readyz, /version
 │   ├── persistence/
+│   │   ├── postgres/      pool, migrator, sync-state repository
+│   │   └── redis/         client + health
+│   ├── queue/             Asynq client/server, queue and task names
+│   │   └── tasks/         handlers
 │   └── observability/
+│       ├── logging/       slog setup
+│       └── buildinfo/     version metadata
 │
-├── migrations/
-├── contracts/
-├── deployments/
+├── migrations/            embedded goose SQL migrations
+├── deployments/postgres/  PostgreSQL 17 + pg_partman image
+├── tests/integration/     tests against real Postgres, Redis, Asynq and RPC
 ├── docs/
-│   ├── architecture.excalidraw
-│   └── architecture.svg
-├── tests/
-├── CLAUDE.md
 ├── docker-compose.yml
+├── Dockerfile
 ├── Makefile
 └── README.md
 ```
+
+Later phases add `token/`, `discovery/`, `security/`, `market/`, `insider/`,
+`social/`, `scoring/`, `strategy/`, `risk/`, `wallet/`, `execution/`,
+`position/`, `pnl/` and `telegram/` as the features that need them land.
 
 ---
 
@@ -686,7 +821,7 @@ RH_WS_URL=
 
 POSTGRES_URL=
 REDIS_URL=
-NATS_URL=
+Asynq_URL=
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_USER_IDS=
@@ -712,46 +847,98 @@ MIN_SCORE=
 
 ### Prerequisites
 
-- Go
-- Docker
-- Docker Compose
+- Go 1.26+
+- Docker and Docker Compose
 - Git
-- Telegram account
-- Telegram bot created through BotFather
-- EVM wallet for testnet/development
-- RPC access
+- An RPC endpoint (the public one works for development; see below)
 
-### Start dependencies
+Telegram and a wallet are not needed yet — those arrive in Phase 2 and Phase 3.
 
-```bash
-docker compose up -d
-```
-
-### Create environment
+### Quick start
 
 ```bash
-cp .env.example .env
+cp .env.example .env     # then edit if ports 5432/6379/8080/8081 are taken
+make up                  # postgres + redis + asynqmon, then migrations
+make test                # unit tests, no external dependencies
+make run-api             # http://localhost:8080/readyz
+make run-worker          # in another shell
 ```
 
-### Run tests
+`make help` lists every target.
+
+### Ports
+
+If a port is already in use on your machine, set it in `.env` — both `make` and
+`docker compose` read that file, so they stay in sync:
+
+```env
+POSTGRES_PORT=55432
+REDIS_PORT=56379
+ASYNQMON_PORT=8091
+POSTGRES_URL=postgres://hoodalpha:hoodalpha@localhost:55432/hoodalpha?sslmode=disable
+REDIS_ADDR=localhost:56379
+```
+
+### Endpoints
+
+| URL | Purpose |
+|---|---|
+| `http://localhost:8080/healthz` | Liveness. Dependency-free on purpose: a database blip must not make an orchestrator kill a process that is correctly refusing to trade. |
+| `http://localhost:8080/readyz` | Readiness. Probes Postgres, Redis, chain RPC and the websocket subscription. Returns 503 when any is down. |
+| `http://localhost:8080/version` | Build metadata. |
+| `http://127.0.0.1:8081` | Asynqmon. Bound to loopback because it has no authentication of its own. |
+
+### Migrations
 
 ```bash
-go test ./...
+make migrate-up        # apply pending
+make migrate-down      # roll back exactly one
+make migrate-status    # what is applied, what is pending
+make db-recreate       # roll back to zero, then rebuild (development only)
 ```
 
-### Run bot
+Migrations are embedded in the binary, so a container migrates itself without
+the repository being present. `migrate reset` refuses to run when
+`APP_ENV=production`.
+
+### RPC configuration
+
+```env
+RH_CHAIN_ID=4663
+RH_RPC_URL=https://rpc.mainnet.chain.robinhood.com
+RH_WS_URL=
+```
+
+The public endpoint is rate-limited and not recommended for production; the
+official docs recommend Alchemy (`https://robinhood-mainnet.g.alchemy.com/v2/{API_KEY}`,
+`wss://...` for the websocket). `RH_WS_URL` is optional — without it the bot
+still reads the chain over HTTP, it just loses push-based head updates.
+
+The chain ID is verified at startup. Connecting to the wrong network aborts the
+process rather than producing balances that silently refer to another chain.
+
+### Tests
 
 ```bash
-go run ./cmd/bot
+make test               # unit tests only, no infrastructure needed
+make test-integration   # against real Postgres, Redis, Asynq and RPC
+make test-all
 ```
 
-### Run scanner
+Integration tests are not mocked. Each one skips unless its endpoint is
+configured, so `go test ./...` stays green on a machine without Docker:
 
-```bash
-go run ./cmd/scanner
-```
+| Variable | Enables |
+|---|---|
+| `TEST_POSTGRES_URL` | database, migration and pg_partman tests |
+| `TEST_REDIS_ADDR` | Redis, Asynq and Asynqmon tests |
+| `TEST_RH_RPC_URL` | chain RPC tests |
+| `TEST_RH_WS_URL` | websocket subscription and reconnect tests |
 
-Exact commands may evolve with the implementation.
+`make test-integration` sets these from your `.env`. Websocket tests need a real
+`wss://` JSON-RPC endpoint; the public `feed.mainnet.chain.robinhood.com` is a
+sequencer feed, not JSON-RPC, so use a provider endpoint or a local node
+(`anvil --chain-id 4663 --block-time 2`).
 
 ---
 
@@ -780,9 +967,18 @@ Exact commands may evolve with the implementation.
 
 ## Project Status
 
-**Experimental / Early Development**
+**Experimental / Early Development — Phase 0 and Phase 1 implemented.**
 
-The architecture and specification are intentionally ahead of the implementation.
+What runs today: configuration, logging, health checks, PostgreSQL with
+migrations and pg_partman, Redis, Asynq with Asynqmon, and a read-only Robinhood
+Chain client with websocket head subscription and reconnect.
+
+What does not exist yet: Telegram, wallets, token discovery, analysis, scoring,
+strategy, risk engine, and execution. There is **no signer and no broadcast
+path** in the codebase — the chain client is read-only by construction, so this
+build cannot move funds.
+
+The architecture and specification remain ahead of the implementation.
 
 Expect:
 
@@ -798,24 +994,34 @@ This repository should not be treated as production-safe until security, executi
 
 ## Roadmap
 
-### Phase 0 — Foundation
+### Phase 0 — Foundation ✅
 
-- [ ] Go module
-- [ ] Clean Architecture skeleton
-- [ ] Docker Compose
-- [ ] PostgreSQL
-- [ ] Redis
-- [ ] NATS
-- [ ] CI
-- [ ] logging / health
+- [x] Go module
+- [x] Clean Architecture skeleton
+- [x] configuration loading + validation
+- [x] structured logging, build metadata
+- [x] graceful shutdown, context propagation
+- [x] Docker Compose (postgres, redis, asynqmon, api, worker, migrate)
+- [x] PostgreSQL 17 + connection pooling + health
+- [x] versioned migrations with tested rollback
+- [x] pg_partman 5.5.0, non-superuser maintenance role
+- [x] Redis
+- [x] Asynq client/server, queues, retry, idempotency keys
+- [x] Asynqmon
+- [x] CI (fmt, vet, unit, integration, image build)
+- [x] health endpoints
 
-### Phase 1 — Chain
+### Phase 1 — Chain ✅
 
-- [ ] Robinhood Chain RPC
-- [ ] WebSocket
-- [ ] block listener
-- [ ] balance reads
-- [ ] transaction reads
+- [x] Robinhood Chain RPC client (go-ethereum)
+- [x] chain ID verification at startup
+- [x] bounded retries, exponential backoff, timeouts
+- [x] WebSocket head subscription with reconnect
+- [x] block listener + persisted sync state
+- [x] balance reads
+- [x] transaction and receipt reads
+- [x] event log retrieval
+- [x] address/hash validation
 
 ### Phase 2 — Telegram
 
@@ -959,6 +1165,8 @@ Add an explicit open-source license before accepting external contributions. MIT
 
 ## Philosophy
 
+This project uses Asynq for background jobs. It does not use Asynq, RabbitMQ, or Kafka as the background-job layer.
+
 The goal is not:
 
 ```text
@@ -997,6 +1205,7 @@ Keep both the editable architecture source and rendered image:
 
 ```text
 docs/
+├── architecture.excalidraw
 └── architecture.svg
 ```
 
