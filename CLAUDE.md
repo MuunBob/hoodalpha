@@ -290,6 +290,8 @@ Use:
 ## Cache / coordination
 
 - Redis
+- Asynq (`github.com/hibiken/asynq`)
+- Asynqmon (`github.com/hibiken/asynqmon`)
 
 Use Redis for:
 
@@ -300,26 +302,63 @@ Use Redis for:
 
 Do not make Redis the source of truth for financial records.
 
-## Event bus
+## Background Jobs — Asynq
 
-- NATS JetStream initially
+Use the official Asynq project only:
 
-Use events for:
+- Repository: https://github.com/hibiken/asynq
+- Go module: `github.com/hibiken/asynq`
 
-- token discovered,
-- token analyzed,
-- signal created,
-- order requested,
-- order simulated,
-- order submitted,
-- fill received,
-- position changed,
-- stop loss triggered,
-- capital recovery triggered,
-- runner updated,
-- PnL updated.
+Use Asynq as the background task queue for this project. Redis is the backing store. PostgreSQL remains the source of truth for persistent/financial state.
 
-Avoid introducing Kafka unless actual scale justifies it.
+Use Asynq for asynchronous work such as token discovery, analysis, security scans, market refreshes, insider analysis, social analysis, notifications, transaction monitoring, position reconciliation, PnL updates, scheduled maintenance, and health/reconciliation jobs.
+
+Suggested task names:
+
+```text
+token:discover
+token:analyze
+token:security_scan
+token:market_scan
+token:insider_scan
+token:social_scan
+signal:score
+signal:notify
+trade:simulate
+trade:submit
+trade:monitor
+position:update
+position:recover_capital
+position:update_runner
+pnl:update
+system:reconcile
+system:health_check
+```
+
+Suggested queues:
+
+```text
+critical
+default
+analysis
+market
+notifications
+maintenance
+```
+
+Tasks must be retry-safe and idempotent where practical. Never assume exactly-once execution. Use task IDs/idempotency keys and persisted state transitions for financial operations.
+
+Do not use Asynq, Asynq, RabbitMQ, Kafka, or another queue system for the current architecture.
+
+## Asynqmon
+
+Use the official Asynqmon project only:
+
+- Repository: https://github.com/hibiken/asynqmon
+
+Asynqmon is the operational monitoring UI for Asynq. Use it to inspect pending, active, scheduled, retried, failed, and archived tasks plus queue state. Run it in Docker Compose for local development. Do not expose it publicly in production without authentication/network restrictions.
+
+Before implementation, inspect the official repositories and verify the current compatible API/version for the project Go version. Pin versions in `go.mod` and infrastructure configuration.
 
 ## Telegram
 
@@ -1281,7 +1320,7 @@ Test:
 
 - PostgreSQL,
 - Redis,
-- NATS,
+- Asynq,
 - Telegram,
 - RPC,
 - DEX adapters.
@@ -1443,7 +1482,7 @@ RH_WS_URL=
 
 POSTGRES_URL=
 REDIS_URL=
-NATS_URL=
+REDIS_URL=
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ALLOWED_USER_IDS=
