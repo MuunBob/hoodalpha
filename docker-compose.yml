@@ -1,0 +1,126 @@
+name: hoodalpha
+
+services:
+  postgres:
+    build:
+      context: ./deployments/postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hoodalpha}
+      POSTGRES_USER: ${POSTGRES_USER:-hoodalpha}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hoodalpha}
+      # Deterministic collation so index ordering does not shift between hosts.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hoodalpha} -d ${POSTGRES_DB:-hoodalpha}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    # appendonly keeps Asynq's queue state across a restart. Redis is still not
+    # the source of truth for money — this only avoids losing scheduled jobs.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+    entrypoint: ["/usr/local/bin/migrate"]
+    command: ["up"]
+    environment:
+      POSTGRES_URL: postgres://${POSTGRES_USER:-hoodalpha}:${POSTGRES_PASSWORD:-hoodalpha}@postgres:5432/${POSTGRES_DB:-hoodalpha}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      LOG_JSON: "${LOG_JSON:-false}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    entrypoint: ["/usr/local/bin/api"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_URL: postgres://${POSTGRES_USER:-hoodalpha}:${POSTGRES_PASSWORD:-hoodalpha}@postgres:5432/${POSTGRES_DB:-hoodalpha}?sslmode=disable
+      REDIS_ADDR: redis:6379
+      HTTP_ADDR: ":8080"
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # distroless has no shell or curl, so the binary probes itself.
+      test: ["CMD", "/usr/local/bin/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    entrypoint: ["/usr/local/bin/worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_URL: postgres://${POSTGRES_USER:-hoodalpha}:${POSTGRES_PASSWORD:-hoodalpha}@postgres:5432/${POSTGRES_DB:-hoodalpha}?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  asynqmon:
+    image: hibiken/asynqmon:0.7.2
+    # Upstream publishes amd64 only; on Apple Silicon this runs emulated.
+    # It is a read-only admin UI, so the emulation cost does not matter.
+    platform: linux/amd64
+    command:
+      - "--redis-addr=redis:6379"
+      - "--port=8081"
+    ports:
+      # Bound to loopback: Asynqmon has no authentication of its own and must
+      # never be reachable from the internet. On a VPS, reach it via SSH tunnel.
+      - "127.0.0.1:${ASYNQMON_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
