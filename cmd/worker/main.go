@@ -22,7 +22,23 @@ import (
 	"github.com/MuunBob/hoodalpha/internal/persistence/postgres"
 	"github.com/MuunBob/hoodalpha/internal/queue"
 	"github.com/MuunBob/hoodalpha/internal/queue/tasks"
+	"github.com/MuunBob/hoodalpha/internal/telegram"
 )
+
+// defaultPolicy seeds a newly linked wallet from configured risk settings.
+// Trading is off regardless of configuration.
+func defaultPolicy(cfg config.Config) domain.WalletPolicy {
+	return domain.WalletPolicy{
+		MaxPositionPercent:     cfg.Risk.MaxPositionPercent,
+		MaxOpenPositions:       cfg.Risk.MaxOpenPositions,
+		DailyLossLimitPercent:  cfg.Risk.DailyLossLimitPercent,
+		StopLossPercent:        cfg.Risk.StopLossPercent,
+		CapitalRecoveryPercent: cfg.Risk.CapitalRecoveryPercent,
+		MaxSlippageBPS:         cfg.Risk.MaxSlippageBPS,
+		MinLiquidityUSD:        cfg.Risk.MinLiquidityUSD,
+		TradingEnabled:         false,
+	}
+}
 
 func main() {
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
@@ -70,9 +86,37 @@ func run() error {
 		Version:       info.Version,
 	})
 
+	queueClient := queue.NewClient(cfg.Redis)
+	defer func() { _ = queueClient.Close() }()
+
+	walletSvc := application.NewWalletService(application.WalletServiceDeps{
+		Wallets:       postgres.NewWalletRepo(deps.Postgres),
+		Audit:         postgres.NewAuditRepo(deps.Postgres),
+		Chain:         deps.Chain,
+		Queue:         queue.NewEnqueuer(queueClient),
+		ChainID:       cfg.Chain.ChainID,
+		DefaultPolicy: defaultPolicy(cfg),
+		Logger:        log,
+	})
+
 	srv := queue.NewServer(cfg.Redis, cfg.Worker, log)
 	srv.Handle(queue.TypeSystemHealthCheck, tasks.HealthCheck(health, log))
 	srv.Handle(queue.TypeChainSyncHead, tasks.SyncHead(chainSync, log))
+	srv.Handle(queue.TypeWalletVerify, tasks.WalletVerify(walletSvc, log))
+
+	// Notifications need the Telegram transport. Without a token the handler
+	// is not registered at all, so a queued message fails visibly rather than
+	// being silently dropped by a no-op handler.
+	if cfg.Telegram.Enabled() {
+		notifier, err := telegram.NewNotifier(cfg.Telegram.BotToken, log)
+		if err != nil {
+			return err
+		}
+		srv.Handle(queue.TypeTelegramNotification, tasks.TelegramNotification(notifier, log))
+		log.Info("telegram notifications enabled")
+	} else {
+		log.Warn("TELEGRAM_BOT_TOKEN not set; telegram notifications disabled")
+	}
 
 	scheduler := newScheduler(cfg, log)
 

@@ -18,7 +18,33 @@ import (
 	"github.com/MuunBob/hoodalpha/internal/observability/buildinfo"
 	"github.com/MuunBob/hoodalpha/internal/observability/logging"
 	"github.com/MuunBob/hoodalpha/internal/persistence/postgres"
+	redisstore "github.com/MuunBob/hoodalpha/internal/persistence/redis"
+	"github.com/MuunBob/hoodalpha/internal/queue"
+	"github.com/MuunBob/hoodalpha/internal/telegram/initdata"
 )
+
+func toTelegramIDs(ids []int64) []domain.TelegramUserID {
+	out := make([]domain.TelegramUserID, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, domain.TelegramUserID(id))
+	}
+	return out
+}
+
+// defaultPolicy seeds a newly linked wallet from configured risk settings.
+// Trading is off regardless of configuration.
+func defaultPolicy(cfg config.Config) domain.WalletPolicy {
+	return domain.WalletPolicy{
+		MaxPositionPercent:     cfg.Risk.MaxPositionPercent,
+		MaxOpenPositions:       cfg.Risk.MaxOpenPositions,
+		DailyLossLimitPercent:  cfg.Risk.DailyLossLimitPercent,
+		StopLossPercent:        cfg.Risk.StopLossPercent,
+		CapitalRecoveryPercent: cfg.Risk.CapitalRecoveryPercent,
+		MaxSlippageBPS:         cfg.Risk.MaxSlippageBPS,
+		MinLiquidityUSD:        cfg.Risk.MinLiquidityUSD,
+		TradingEnabled:         false,
+	}
+}
 
 func main() {
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
@@ -69,6 +95,9 @@ func run() error {
 		log.Warn("RH_WS_URL not set; running without websocket head subscription")
 	}
 
+	queueClient := queue.NewClient(cfg.Redis)
+	defer func() { _ = queueClient.Close() }()
+
 	syncRepo := postgres.NewSyncStateRepo(deps.Postgres)
 	chainSync := application.NewChainSync(deps.Chain, syncRepo, cfg.Chain.ChainID, log)
 
@@ -95,7 +124,49 @@ func run() error {
 	}
 	health := application.NewHealthChecker(healthDeps)
 
-	srv := httpapi.New(cfg.HTTPAddr, health, log)
+	// The Mini App backend is only mounted when a bot token is configured.
+	// Without one, initData cannot be verified, so exposing the routes would
+	// mean exposing endpoints that could never authenticate anyone.
+	miniApp := httpapi.MiniAppDeps{ChainID: cfg.Chain.ChainID}
+	if cfg.Telegram.Enabled() {
+		verifier, err := initdata.NewVerifier(initdata.Options{
+			BotToken: cfg.Telegram.BotToken,
+			TTL:      cfg.Telegram.InitDataTTL,
+			// Replay protection lives in Redis so a replayed payload is
+			// refused even when it reaches a different replica.
+			Guard: redisstore.NewReplayGuard(deps.Redis, "miniapp"),
+		})
+		if err != nil {
+			return err
+		}
+		onboarding := application.NewOnboarding(
+			postgres.NewUserRepo(deps.Postgres),
+			postgres.NewAuditRepo(deps.Postgres),
+			domain.NewAllowlist(toTelegramIDs(cfg.Telegram.AllowedUserIDs)),
+			log)
+
+		miniApp.Auth = application.NewMiniAppAuth(verifier, onboarding,
+			postgres.NewAuditRepo(deps.Postgres), log)
+		miniApp.Wallets = application.NewWalletService(application.WalletServiceDeps{
+			Wallets:       postgres.NewWalletRepo(deps.Postgres),
+			Audit:         postgres.NewAuditRepo(deps.Postgres),
+			Chain:         deps.Chain,
+			Queue:         queue.NewEnqueuer(queueClient),
+			ChainID:       cfg.Chain.ChainID,
+			DefaultPolicy: defaultPolicy(cfg),
+			Logger:        log,
+		})
+		log.Info("mini app backend enabled", "init_data_ttl", cfg.Telegram.InitDataTTL.String())
+	} else {
+		log.Warn("TELEGRAM_BOT_TOKEN not set; mini app backend disabled")
+	}
+
+	srv := httpapi.New(httpapi.Options{
+		Addr:    cfg.HTTPAddr,
+		Health:  health,
+		Logger:  log,
+		MiniApp: miniApp,
+	})
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return srv.Run(gctx, cfg.ShutdownTimeout) })

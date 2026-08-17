@@ -25,7 +25,29 @@ type Config struct {
 	Redis    RedisConfig
 	Worker   WorkerConfig
 	Risk     RiskConfig
+	Telegram TelegramConfig
 }
+
+// TelegramConfig configures the control plane.
+type TelegramConfig struct {
+	// BotToken comes from BotFather. Secret: never logged, never audited.
+	BotToken string
+	// AllowedUserIDs is a closed allowlist of Telegram user IDs. Empty means
+	// nobody may control the bot — an unconfigured deployment must be closed,
+	// not open.
+	AllowedUserIDs []int64
+	// MiniAppURL is shown by /connect. Optional.
+	MiniAppURL string
+	// InitDataTTL bounds how old Mini App init data may be. Short windows
+	// limit the value of a captured payload.
+	InitDataTTL time.Duration
+	// RateLimit is commands allowed per RateWindow, per user.
+	RateLimit  int
+	RateWindow time.Duration
+}
+
+// Enabled reports whether the Telegram control plane can start.
+func (t TelegramConfig) Enabled() bool { return t.BotToken != "" }
 
 // ChainConfig describes the Robinhood Chain endpoints the bot reads from.
 type ChainConfig struct {
@@ -191,6 +213,21 @@ func Load() (Config, error) {
 		e(err)
 	}
 
+	cfg.Telegram.BotToken = os.Getenv("TELEGRAM_BOT_TOKEN")
+	if cfg.Telegram.AllowedUserIDs, err = getInt64List("TELEGRAM_ALLOWED_USER_IDS"); err != nil {
+		e(err)
+	}
+	cfg.Telegram.MiniAppURL = getString("TELEGRAM_MINIAPP_URL", "")
+	if cfg.Telegram.InitDataTTL, err = getDuration("TELEGRAM_INITDATA_TTL", 15*time.Minute); err != nil {
+		e(err)
+	}
+	if cfg.Telegram.RateLimit, err = getInt("TELEGRAM_RATE_LIMIT", 20); err != nil {
+		e(err)
+	}
+	if cfg.Telegram.RateWindow, err = getDuration("TELEGRAM_RATE_WINDOW", time.Minute); err != nil {
+		e(err)
+	}
+
 	if len(errs) > 0 {
 		return Config{}, errors.Join(errs...)
 	}
@@ -240,6 +277,18 @@ func (c Config) validate() error {
 	}
 	if c.Risk.MaxSlippageBPS < 0 || c.Risk.MaxSlippageBPS > 10000 {
 		errs = append(errs, errors.New("MAX_SLIPPAGE_BPS must be in [0,10000]"))
+	}
+	// A configured bot with an empty allowlist would answer nobody, which
+	// looks identical to a broken deployment. Refuse it at startup instead.
+	if c.Telegram.Enabled() && len(c.Telegram.AllowedUserIDs) == 0 {
+		errs = append(errs, errors.New(
+			"TELEGRAM_ALLOWED_USER_IDS is required when TELEGRAM_BOT_TOKEN is set"))
+	}
+	if c.Telegram.InitDataTTL <= 0 {
+		errs = append(errs, errors.New("TELEGRAM_INITDATA_TTL must be > 0"))
+	}
+	if c.Telegram.RateLimit < 1 {
+		errs = append(errs, errors.New("TELEGRAM_RATE_LIMIT must be >= 1"))
 	}
 	return errors.Join(errs...)
 }
@@ -308,6 +357,32 @@ func getBool(key string, def bool) (bool, error) {
 		return false, fmt.Errorf("%s: %w", key, err)
 	}
 	return b, nil
+}
+
+// getInt64List parses a comma-separated list of integers. Used for the
+// Telegram allowlist, where a malformed entry must fail startup rather than
+// be silently dropped — a dropped ID locks its owner out.
+func getInt64List(key string) ([]int64, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var out []int64
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %q is not a valid id", key, part)
+		}
+		if n <= 0 {
+			return nil, fmt.Errorf("%s: id %d must be positive", key, n)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 func getDuration(key string, def time.Duration) (time.Duration, error) {
