@@ -5,6 +5,7 @@ go 1.26.5
 require (
 	github.com/ethereum/go-ethereum v1.17.5
 	github.com/go-chi/chi/v5 v5.3.1
+	github.com/go-telegram/bot v1.23.0
 	github.com/hibiken/asynq v0.26.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pressly/goose/v3 v3.27.3

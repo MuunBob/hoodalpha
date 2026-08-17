@@ -458,10 +458,11 @@ The project does **not** partition every table.
 Append-only and unbounded: every command, state transition and operator action
 lands there.
 
-**Deliberately not partitioned:** `chain_sync_state`, and later `users`,
-`telegram_users`, `wallets`, `wallet_policies`, `tokens`, `token_contracts`,
-`orders`, `positions`. These are bounded current-state tables. Partitioning them
-would add child-table management cost and cross-partition joins for no gain.
+**Deliberately not partitioned:** `chain_sync_state`, `users`,
+`telegram_users`, `wallets`, `wallet_policies`, and later `tokens`,
+`token_contracts`, `orders`, `positions`. These are bounded current-state
+tables. Partitioning them would add child-table management cost and
+cross-partition joins for no gain.
 
 **Future candidates,** to be partitioned when the feature that writes them lands
 and the volume justifies it: `market_snapshots`, `wallet_events`,
@@ -648,22 +649,27 @@ today (Phase 0 + Phase 1):
 ```text
 .
 ├── cmd/
-│   ├── api/               operational HTTP server + websocket head subscriber
+│   ├── api/               operational HTTP + Mini App backend + head subscriber
+│   ├── bot/               Telegram control plane
 │   ├── worker/            Asynq worker + periodic scheduler
 │   ├── migrate/           migration CLI (up/down/reset/status/version)
 │   └── healthcheck/       container HEALTHCHECK probe (distroless has no curl)
 │
 ├── internal/
-│   ├── domain/            Address, Hash, BlockRef, Wei, health types
-│   ├── application/       use cases: health check, chain sync
+│   ├── domain/            Address, Hash, BlockRef, Wei, User, Wallet, policy,
+│   │                      allowlist, audit, health — no infrastructure imports
+│   ├── application/       use cases: health, chain sync, onboarding,
+│   │                      wallet linking/verification, Mini App auth
 │   ├── bootstrap/         dependency wiring + signal handling
 │   ├── chain/             go-ethereum adapter, retry policy, head subscriber
 │   ├── config/            environment loading and validation
-│   ├── httpapi/           /healthz, /readyz, /version
+│   ├── httpapi/           /healthz, /readyz, /version, /api/miniapp/*
+│   ├── telegram/          router, commands, bot and notifier transports
+│   │   └── initdata/      Mini App signature verification
 │   ├── persistence/
-│   │   ├── postgres/      pool, migrator, sync-state repository
-│   │   └── redis/         client + health
-│   ├── queue/             Asynq client/server, queue and task names
+│   │   ├── postgres/      pool, migrator, user/wallet/audit/sync repositories
+│   │   └── redis/         client, replay guard, rate limiter
+│   ├── queue/             Asynq client/server, enqueuer, queue and task names
 │   │   └── tasks/         handlers
 │   └── observability/
 │       ├── logging/       slog setup
@@ -680,8 +686,8 @@ today (Phase 0 + Phase 1):
 ```
 
 Later phases add `token/`, `discovery/`, `security/`, `market/`, `insider/`,
-`social/`, `scoring/`, `strategy/`, `risk/`, `wallet/`, `execution/`,
-`position/`, `pnl/` and `telegram/` as the features that need them land.
+`social/`, `scoring/`, `strategy/`, `risk/`, `execution/`, `position/` and
+`pnl/` as the features that need them land.
 
 ---
 
@@ -917,6 +923,50 @@ still reads the chain over HTTP, it just loses push-based head updates.
 The chain ID is verified at startup. Connecting to the wrong network aborts the
 process rather than producing balances that silently refer to another chain.
 
+### Telegram setup
+
+```env
+TELEGRAM_BOT_TOKEN=<from @BotFather>
+TELEGRAM_ALLOWED_USER_IDS=123456789      # your numeric ID, from @userinfobot
+TELEGRAM_MINIAPP_URL=                    # optional
+TELEGRAM_INITDATA_TTL=15m
+TELEGRAM_RATE_LIMIT=20
+TELEGRAM_RATE_WINDOW=1m
+```
+
+```bash
+make run-bot                              # locally
+docker compose --profile telegram up -d   # or as a container
+```
+
+Leaving the token blank is supported: `api` and `worker` run without it, and the
+Mini App routes are then not mounted at all rather than exposed and unusable.
+
+`TELEGRAM_ALLOWED_USER_IDS` is required whenever a token is set, and startup
+fails without it. An empty allowlist would answer nobody, which is
+indistinguishable from a broken deployment — and defaulting to open on a process
+that will eventually hold funds is not an acceptable failure mode.
+
+### Security model
+
+| Control | Behaviour |
+|---|---|
+| **Identity** | Telegram numeric user ID, never the username. Usernames are mutable and reusable, so authorizing on one would let a released username inherit access. The database mirrors this: `telegram_id` is the primary key, `username` is a nullable display cache with no unique constraint. |
+| **Allowlist** | Closed. Unknown IDs are refused before any row is written, so an unauthorized user cannot populate the database by sending messages. Empty means nobody. |
+| **Suspension** | An account can be suspended in the database to revoke access without editing configuration and restarting. |
+| **Rejection replies** | One terse "Not authorized." Nothing about whether the command exists, who is allowed, or why — a rejection is not a debugging aid for an attacker. |
+| **Mini App** | Treated as an untrusted client. Only the signed `initData` is verified; `initDataUnsafe` is never read. Identity comes from the verified payload, so the allowlist is checked against a signed user ID rather than a claimed one. |
+| **initData verification** | HMAC-SHA256 against a key derived from the bot token, in constant time, plus an `auth_date` TTL and a future-date bound with small clock-skew tolerance. Ed25519 third-party verification is available for a component that must not hold the token. |
+| **Replay protection** | Redis `SETNX`, so a captured payload is refused on second use even if it reaches a different replica. Fails **closed**: if Redis is unavailable, the request is refused rather than silently proceeding with replay protection disabled. |
+| **Credential handling** | `initData` is accepted from headers only, never the query string — URLs end up in proxy logs and browser history. |
+| **Rate limiting** | Fixed window per user, in Redis. Fails **open**: a Redis outage must not lock the operator out of their own control plane, and the allowlist still gates access independently. |
+| **Ownership** | Checked server-side on every wallet read and write. A client can send any wallet ID; "not yours" and "does not exist" return the same 404 so the response is not an enumeration oracle. |
+| **Policy limits** | Validated in the use case, in the repository, and by database `CHECK` constraints. A limit that bounds real money is asserted at all three layers, so no single bypassed path can widen it. |
+| **Trading flag** | `trading_enabled` defaults to false and linking a wallet never sets it, regardless of configured defaults. Enabling it is always a separate, audited decision. |
+| **Key material** | Never stored, and there is no column for it. `/connect` additionally refuses input shaped like a private key or BIP-39 mnemonic before it is parsed, logged or stored, and tells the user to rotate the wallet. |
+| **Audit trail** | Onboarding, authorization failures, rate limiting, every command, Mini App auth and rejections, wallet linking and verification, and policy changes — with before/after values, because during an incident the question is always which limit moved. Secrets are never written to it. |
+| **Error messages** | Handler errors are logged, not echoed. An error string can carry a connection string or an internal path. |
+
 ### Tests
 
 ```bash
@@ -967,16 +1017,19 @@ sequencer feed, not JSON-RPC, so use a provider endpoint or a local node
 
 ## Project Status
 
-**Experimental / Early Development — Phase 0 and Phase 1 implemented.**
+**Experimental / Early Development — Phases 0 through 3 implemented.**
 
 What runs today: configuration, logging, health checks, PostgreSQL with
-migrations and pg_partman, Redis, Asynq with Asynqmon, and a read-only Robinhood
-Chain client with websocket head subscription and reconnect.
+migrations and pg_partman, Redis, Asynq with Asynqmon, a read-only Robinhood
+Chain client with websocket head subscription and reconnect, the Telegram
+control plane (`/start`, `/status`, `/health`, `/connect`) with an allowlist and
+audit trail, the Mini App backend with server-side `initData` verification, and
+wallet onboarding with per-wallet policies.
 
-What does not exist yet: Telegram, wallets, token discovery, analysis, scoring,
-strategy, risk engine, and execution. There is **no signer and no broadcast
-path** in the codebase — the chain client is read-only by construction, so this
-build cannot move funds.
+What does not exist yet: token discovery, analysis, scoring, strategy, risk
+engine, and execution. There is **no signer and no broadcast path** in the
+codebase — the chain client is read-only by construction and the schema has no
+column for key material, so this build cannot move funds.
 
 The architecture and specification remain ahead of the implementation.
 
@@ -1023,19 +1076,19 @@ This repository should not be treated as production-safe until security, executi
 - [x] event log retrieval
 - [x] address/hash validation
 
-### Phase 2 — Telegram
+### Phase 2 — Telegram ✅
 
-- [ ] `/start`
-- [ ] authentication
-- [ ] command router
-- [ ] alerts
+- [x] `/start`, `/status`, `/health`, `/connect`, `/help`
+- [x] authorization on Telegram numeric user ID, closed allowlist
+- [x] command router with rate limiting and audit logging
+- [x] alert delivery via the notifications queue
 
-### Phase 3 — Wallet
+### Phase 3 — Wallet ✅
 
-- [ ] Mini App
-- [ ] wallet authorization
-- [ ] chain verification
-- [ ] bot-wallet policy
+- [x] Mini App backend with server-side `initData` verification
+- [x] replay protection and auth-date TTL
+- [x] wallet linking, on-chain verification, status state machine
+- [x] per-wallet policy persisted and enforced server-side
 
 ### Phase 4 — Discovery
 
