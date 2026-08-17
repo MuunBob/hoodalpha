@@ -22,8 +22,10 @@ const (
 // remaining names are reserved so later phases do not rename queues in flight.
 const (
 	// Implemented now.
-	TypeSystemHealthCheck = "system:health_check"
-	TypeChainSyncHead     = "chain:sync_head"
+	TypeSystemHealthCheck    = "system:health_check"
+	TypeChainSyncHead        = "chain:sync_head"
+	TypeWalletVerify         = "wallet:verify"
+	TypeTelegramNotification = "telegram:notification"
 
 	// Reserved for later phases.
 	TypeTokenDiscover        = "token:discover"

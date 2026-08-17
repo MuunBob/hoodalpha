@@ -24,12 +24,26 @@ type Server struct {
 	log  *slog.Logger
 }
 
+// Options configure the HTTP server.
+type Options struct {
+	Addr   string
+	Health *application.HealthChecker
+	Logger *slog.Logger
+	// MiniApp is optional. Its routes are only mounted when Auth is wired,
+	// so a deployment without a bot token exposes no Mini App surface at all.
+	MiniApp MiniAppDeps
+}
+
 // New builds the operational server.
-func New(addr string, health *application.HealthChecker, log *slog.Logger) *Server {
+func New(opts Options) *Server {
+	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 	log = log.With("component", "http")
+
+	s := &Server{log: log}
+	health := opts.Health
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -57,18 +71,22 @@ func New(addr string, health *application.HealthChecker, log *slog.Logger) *Serv
 		writeJSON(w, http.StatusOK, buildinfo.Get())
 	})
 
-	return &Server{
-		http: &http.Server{
-			Addr:              addr,
-			Handler:           r,
-			ReadHeaderTimeout: 5 * time.Second,
-			ReadTimeout:       15 * time.Second,
-			WriteTimeout:      30 * time.Second,
-			IdleTimeout:       60 * time.Second,
-		},
-		log: log,
+	s.mountMiniApp(r, opts.MiniApp)
+
+	s.http = &http.Server{
+		Addr:              opts.Addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+	return s
 }
+
+// Handler returns the configured router. Tests exercise the real routes and
+// middleware through it rather than reimplementing the wiring.
+func (s *Server) Handler() http.Handler { return s.http.Handler }
 
 // Run serves until ctx is cancelled, then drains connections within timeout.
 func (s *Server) Run(ctx context.Context, shutdownTimeout time.Duration) error {
