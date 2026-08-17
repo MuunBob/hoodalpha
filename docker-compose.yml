@@ -104,6 +104,30 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  bot:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    entrypoint: ["/usr/local/bin/bot"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_URL: postgres://${POSTGRES_USER:-hoodalpha}:${POSTGRES_PASSWORD:-hoodalpha}@postgres:5432/${POSTGRES_DB:-hoodalpha}?sslmode=disable
+      REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Opt-in: `docker compose --profile telegram up -d`. Without a bot token
+    # this process exits immediately, so it is not part of the default stack.
+    profiles: ["telegram"]
+    restart: unless-stopped
+
   asynqmon:
     image: hibiken/asynqmon:0.7.2
     # Upstream publishes amd64 only; on Apple Silicon this runs emulated.

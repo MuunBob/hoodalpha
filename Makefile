@@ -140,3 +140,7 @@ run-api: ## Run the api process locally
 .PHONY: run-worker
 run-worker: ## Run the worker process locally
 	go run -ldflags "$(LDFLAGS)" ./cmd/worker
+
+.PHONY: run-bot
+run-bot: ## Run the Telegram control plane locally (needs TELEGRAM_BOT_TOKEN)
+	go run -ldflags "$(LDFLAGS)" ./cmd/bot
